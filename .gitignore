@@ -1,0 +1,6 @@
+/target
+data/
+!data/.gitkeep
+temp/*
+!temp/.gitkeep
+.obsidian/
