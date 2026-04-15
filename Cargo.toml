@@ -11,6 +11,10 @@ path = "src/main.rs"
 name = "transcribe"
 path = "src/bin/transcribe.rs"
 
+[[bin]]
+name = "summarize"
+path = "src/bin/summarize.rs"
+
 [dependencies]
 reqwest  = { version = "0.12", features = ["blocking", "multipart", "json"] }
 serde    = { version = "1",    features = ["derive"] }
