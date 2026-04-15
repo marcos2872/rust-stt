@@ -55,7 +55,7 @@
 
 > Copie `.env.example` para `.env` e ajuste os valores.
 
-- **Obrigatórias:** `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_DEPLOYMENT`
+- **Obrigatórias:** `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_DEPLOYMENT_STT`
 - **Opcionais:** `AZURE_OPENAI_API_VERSION` (padrão: `2025-04-01-preview`), `AZURE_OPENAI_LANGUAGE` (padrão: detecção automática, ex.: `pt`)
 
 ## Testes
