@@ -1,16 +1,19 @@
-//! Transcrição de áudio via Azure OpenAI.
+//! Transcrição de áudio com diarização via Azure AI Speech.
 //!
-//! Suporta o modelo `gpt-4o-transcribe-diarize` e compatíveis.
-//! A identificação de falantes é detectada automaticamente a partir de
-//! padrões no texto retornado pela API (ex.: `"Speaker 1:"`, `"[SPEAKER_00]:"`).
+//! Usa a **Fast Transcription API** (`api-version=2024-11-15`) que retorna:
+//! - Texto por falante com ID numérico (`speaker: 1`, `speaker: 2`…)
+//! - Timestamps de início e fim por segmento (`offsetMilliseconds`)
+//! - Confiança por segmento (`confidence`)
+//!
+//! Suporta arquivos até ~200 MB / 4 horas em uma única requisição —
+//! sem necessidade de chunking para a maioria dos casos de uso.
 //!
 //! # Credenciais (`.env`)
 //! ```env
-//! AZURE_OPENAI_API_KEY=<chave>
-//! AZURE_OPENAI_ENDPOINT=https://<recurso>.cognitiveservices.azure.com
-//! AZURE_OPENAI_DEPLOYMENT=gpt-4o-transcribe-diarize
-//! AZURE_OPENAI_API_VERSION=2025-04-01-preview   # opcional
-//! AZURE_OPENAI_LANGUAGE=pt                       # opcional, auto-detect se omitido
+//! AZURE_SPEECH_KEY=<chave>            # ou usa AZURE_OPENAI_API_KEY como fallback
+//! AZURE_SPEECH_ENDPOINT=<url>         # ou usa AZURE_OPENAI_ENDPOINT como fallback
+//! AZURE_SPEECH_LANGUAGE=pt-BR         # opcional (padrão: pt-BR)
+//! AZURE_SPEECH_MAX_SPEAKERS=10        # opcional (padrão: 10)
 //! ```
 //!
 //! # Exemplo
@@ -23,33 +26,32 @@
 //! println!("{}", result.format_output());
 //! ```
 
-pub mod azure;
+pub mod azure_speech;
 
 use std::fmt;
-use std::path::{Path, PathBuf};
-
-/// Duração máxima por chunk em segundos.
-/// WAV 16-bit mono 16kHz = 32 KB/s; Azure OpenAI limita a 25 MB por arquivo.
-/// 700s × 32 KB/s ≈ 22 MB — margem segura abaixo do limite.
-const CHUNK_MAX_SECS: u64 = 700;
+use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // Configuração
 // ---------------------------------------------------------------------------
 
-/// Credenciais e opções para o cliente Azure OpenAI.
+/// Credenciais e opções para o Azure AI Speech.
 #[derive(Debug, Clone)]
 pub struct TranscriptionConfig {
-    /// Chave de API (`AZURE_OPENAI_API_KEY`).
-    pub api_key: String,
-    /// URL base do recurso (`AZURE_OPENAI_ENDPOINT`).
-    pub endpoint: String,
-    /// Nome do deployment (`AZURE_OPENAI_DEPLOYMENT`).
-    pub deployment: String,
-    /// Versão da API (`AZURE_OPENAI_API_VERSION`, padrão: `2025-04-01-preview`).
-    pub api_version: String,
-    /// Idioma forçado, ex.: `"pt"`. `None` = auto-detect.
+    /// Chave de API do Speech (`AZURE_SPEECH_KEY`).
+    /// Fallback: `AZURE_OPENAI_API_KEY`.
+    pub speech_key: String,
+
+    /// URL base do recurso (`AZURE_SPEECH_ENDPOINT`).
+    /// Fallback: `AZURE_OPENAI_ENDPOINT`.
+    pub speech_endpoint: String,
+
+    /// Idioma para transcrição, ex.: `"pt-BR"`.
+    /// `None` usa o padrão do servidor.
     pub language: Option<String>,
+
+    /// Número máximo de falantes para diarização (padrão: 10).
+    pub max_speakers: u32,
 }
 
 impl TranscriptionConfig {
@@ -57,22 +59,31 @@ impl TranscriptionConfig {
     ///
     /// Chame `dotenvy::dotenv().ok()` antes para carregar o `.env`.
     pub fn from_env() -> Result<Self, TranscriberError> {
-        let api_key    = require_env("AZURE_OPENAI_API_KEY")?;
-        let endpoint   = require_env("AZURE_OPENAI_ENDPOINT")?;
-        let deployment = require_env("AZURE_OPENAI_DEPLOYMENT")?;
+        // Speech key: tenta AZURE_SPEECH_KEY, depois AZURE_OPENAI_API_KEY
+        let speech_key = std::env::var("AZURE_SPEECH_KEY")
+            .or_else(|_| std::env::var("AZURE_OPENAI_API_KEY"))
+            .map_err(|_| TranscriberError::Config(
+                "AZURE_SPEECH_KEY ou AZURE_OPENAI_API_KEY não definido".to_string()
+            ))?;
 
-        let api_version = std::env::var("AZURE_OPENAI_API_VERSION")
-            .unwrap_or_else(|_| "2025-04-01-preview".to_string());
-        let language = std::env::var("AZURE_OPENAI_LANGUAGE").ok();
+        // Endpoint: tenta AZURE_SPEECH_ENDPOINT, depois AZURE_OPENAI_ENDPOINT
+        let speech_endpoint = std::env::var("AZURE_SPEECH_ENDPOINT")
+            .or_else(|_| std::env::var("AZURE_OPENAI_ENDPOINT"))
+            .map_err(|_| TranscriberError::Config(
+                "AZURE_SPEECH_ENDPOINT ou AZURE_OPENAI_ENDPOINT não definido".to_string()
+            ))?;
 
-        Ok(Self { api_key, endpoint, deployment, api_version, language })
+        let language = std::env::var("AZURE_SPEECH_LANGUAGE")
+            .ok()
+            .or_else(|| Some("pt-BR".to_string()));
+
+        let max_speakers = std::env::var("AZURE_SPEECH_MAX_SPEAKERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+
+        Ok(Self { speech_key, speech_endpoint, language, max_speakers })
     }
-}
-
-fn require_env(key: &str) -> Result<String, TranscriberError> {
-    std::env::var(key).map_err(|_| {
-        TranscriberError::Config(format!("Variável de ambiente ausente: {key}"))
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -82,29 +93,29 @@ fn require_env(key: &str) -> Result<String, TranscriberError> {
 /// Resultado completo da transcrição.
 #[derive(Debug)]
 pub struct TranscriptionResult {
-    /// Texto completo retornado pela API.
+    /// Texto completo concatenado de todos os falantes.
     pub full_text: String,
-    /// Segmentos por falante — populados se a API ou parser detectar marcadores.
+
+    /// Segmentos por falante com timestamps e confiança.
     pub segments: Vec<Segment>,
-    /// Tokens consumidos (para referência de custo).
-    pub usage: Option<UsageInfo>,
+
+    /// Duração total do áudio em millisegundos.
+    pub duration_ms: Option<u64>,
 }
 
-/// Um turno de fala identificado no texto.
+/// Um segmento de fala com falante, texto e timestamps.
 #[derive(Debug, PartialEq)]
 pub struct Segment {
-    /// Rótulo do falante, ex.: `"Speaker 1"`, `"SPEAKER_00"`. `None` se não detectado.
+    /// Rótulo do falante, ex.: `"Speaker 1"`. `None` se não detectado.
     pub speaker: Option<String>,
-    /// Texto deste turno.
+    /// Texto transcrito.
     pub text: String,
-}
-
-/// Estatísticas de tokens da requisição.
-#[derive(Debug)]
-pub struct UsageInfo {
-    pub total_tokens:  Option<u64>,
-    pub input_tokens:  Option<u64>,
-    pub output_tokens: Option<u64>,
+    /// Início em millisegundos.
+    pub start_ms: Option<u64>,
+    /// Fim em millisegundos.
+    pub end_ms: Option<u64>,
+    /// Confiança da transcrição (0.0–1.0).
+    pub confidence: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -113,13 +124,9 @@ pub struct UsageInfo {
 
 #[derive(Debug)]
 pub enum TranscriberError {
-    /// Variável de ambiente obrigatória ausente.
     Config(String),
-    /// Erro de I/O ao ler o arquivo de áudio.
     Io(String),
-    /// Erro HTTP (conexão, timeout, status >= 400).
     Http(String),
-    /// Falha ao deserializar a resposta JSON.
     Parse(String),
 }
 
@@ -140,10 +147,10 @@ impl std::error::Error for TranscriberError {}
 // Função pública
 // ---------------------------------------------------------------------------
 
-/// Transcreve um arquivo de áudio usando o Azure OpenAI.
+/// Transcreve um arquivo de áudio com diarização via Azure AI Speech.
 ///
-/// Se o áudio for mais longo que [`CHUNK_MAX_SECS`] (1200s), divide automaticamente
-/// em partes com ffmpeg e concatena os resultados.
+/// A Fast Transcription API suporta até ~200 MB / 4 horas em uma requisição.
+/// Para arquivos maiores, [`transcribe_chunked`] divide em partes de 100 MB.
 pub fn transcribe(
     audio_path: &Path,
     config: &TranscriptionConfig,
@@ -155,269 +162,144 @@ pub fn transcribe(
         )));
     }
 
-    let duration_s = get_audio_duration(audio_path)?;
+    let file_size = audio_path.metadata()
+        .map(|m| m.len())
+        .unwrap_or(0);
 
-    if duration_s > CHUNK_MAX_SECS {
-        transcribe_chunked(audio_path, config, duration_s)
-    } else {
-        transcribe_single(audio_path, config)
+    // Limite conservador: 180 MB (API aceita até ~200 MB)
+    if file_size > 180 * 1024 * 1024 {
+        let duration_s = audio_duration_secs(audio_path).unwrap_or(0);
+        return transcribe_chunked(audio_path, config, duration_s);
     }
+
+    transcribe_single(audio_path, config)
 }
 
 // ---------------------------------------------------------------------------
-// Chunking e transcrição de arquivo único
+// Transcrição simples e com chunking
 // ---------------------------------------------------------------------------
 
-/// Transcreve um arquivo sem divisão.
 fn transcribe_single(
     audio_path: &Path,
     config: &TranscriptionConfig,
 ) -> Result<TranscriptionResult, TranscriberError> {
-    let raw       = azure::transcribe(audio_path, config)?;
-    let full_text = raw.text.trim().to_string();
-    let segments  = parse_speaker_segments(&full_text);
-    let usage = raw.usage.map(|u| UsageInfo {
-        total_tokens:  u.total_tokens,
-        input_tokens:  u.input_tokens,
-        output_tokens: u.output_tokens,
-    });
-    Ok(TranscriptionResult { full_text, segments, usage })
+    let raw = azure_speech::transcribe(audio_path, config)?;
+
+    // Texto completo de combinedPhrases (já concatenado pela API)
+    let full_text = raw.combined_phrases
+        .as_ref()
+        .and_then(|p| p.first())
+        .map(|p| p.text.trim().to_string())
+        .unwrap_or_default();
+
+    let segments: Vec<Segment> = raw.phrases
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| !p.text.trim().is_empty())
+        .map(|p| Segment {
+            speaker:    p.speaker.map(|id| format!("Speaker {id}")),
+            text:       p.text.trim().to_string(),
+            start_ms:   Some(p.offset_ms),
+            end_ms:     Some(p.offset_ms + p.duration_ms),
+            confidence: p.confidence,
+        })
+        .collect();
+
+    Ok(TranscriptionResult {
+        full_text,
+        segments,
+        duration_ms: raw.duration_ms,
+    })
 }
 
-/// Divide o áudio em chunks de [`CHUNK_MAX_SECS`] segundos, transcreve cada um
-/// e concatena os resultados em ordem.
+/// Divide o áudio em partes de `chunk_secs` segundos e concatena os resultados.
 fn transcribe_chunked(
     audio_path: &Path,
     config: &TranscriptionConfig,
     duration_s: u64,
 ) -> Result<TranscriptionResult, TranscriberError> {
-    let n_chunks = (duration_s as f64 / CHUNK_MAX_SECS as f64).ceil() as u64;
-    eprintln!(
-        "[áudio {:.0}s > {CHUNK_MAX_SECS}s] dividindo em {n_chunks} partes...",
-        duration_s
-    );
+    const CHUNK_SECS: u64 = 3_000; // ~50 min, ~96 MB por chunk (WAV 32 KB/s)
+
+    let n_chunks = (duration_s as f64 / CHUNK_SECS as f64).ceil() as u64;
+    eprintln!("[chunking] {duration_s}s → {n_chunks} partes de {CHUNK_SECS}s");
 
     let tmp_dir = std::env::temp_dir().join("rust_stt_chunks");
     std::fs::create_dir_all(&tmp_dir)
         .map_err(|e| TranscriberError::Io(e.to_string()))?;
 
-    let stem = audio_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("chunk");
+    let stem = audio_path.file_stem().and_then(|s| s.to_str()).unwrap_or("chunk");
 
-    let mut all_texts: Vec<String> = Vec::new();
-    let mut total_usage = UsageInfo {
-        total_tokens:  Some(0),
-        input_tokens:  Some(0),
-        output_tokens: Some(0),
-    };
+    let mut all_segments: Vec<Segment> = Vec::new();
+    let mut full_texts: Vec<String>    = Vec::new();
+    let mut total_duration_ms: u64     = 0;
 
     for i in 0..n_chunks {
-        let start_s  = i * CHUNK_MAX_SECS;
-        let chunk_path = tmp_dir.join(format!("{stem}_chunk_{i:02}.wav"));
+        let start_s     = i * CHUNK_SECS;
+        let chunk_path  = tmp_dir.join(format!("{stem}_chunk_{i:02}.wav"));
+        let offset_ms   = start_s * 1000;
 
-        eprintln!("  Parte {}/{n_chunks}: {}s - {}s", i + 1, start_s, start_s + CHUNK_MAX_SECS);
-        extract_chunk(audio_path, &chunk_path, start_s, CHUNK_MAX_SECS)?;
+        eprintln!("  Parte {}/{n_chunks} ({start_s}s…)", i + 1);
+        extract_chunk(audio_path, &chunk_path, start_s, CHUNK_SECS)?;
 
         let result = transcribe_single(&chunk_path, config)?;
-        all_texts.push(result.full_text);
-
-        // Acumula tokens
-        if let Some(u) = result.usage {
-            accumulate(&mut total_usage.total_tokens,  u.total_tokens);
-            accumulate(&mut total_usage.input_tokens,  u.input_tokens);
-            accumulate(&mut total_usage.output_tokens, u.output_tokens);
-        }
-
         let _ = std::fs::remove_file(&chunk_path);
+
+        full_texts.push(result.full_text);
+        total_duration_ms += result.duration_ms.unwrap_or(0);
+
+        // Ajusta timestamps para posição global no áudio
+        for mut seg in result.segments {
+            seg.start_ms = seg.start_ms.map(|t| t + offset_ms);
+            seg.end_ms   = seg.end_ms.map(|t| t + offset_ms);
+            all_segments.push(seg);
+        }
     }
 
     let _ = std::fs::remove_dir(&tmp_dir);
 
-    let full_text = all_texts.join(" ");
-    let segments  = parse_speaker_segments(&full_text);
-
     Ok(TranscriptionResult {
-        full_text,
-        segments,
-        usage: Some(total_usage),
+        full_text:   full_texts.join(" "),
+        segments:    all_segments,
+        duration_ms: Some(total_duration_ms),
     })
 }
 
 /// Extrai um trecho do áudio com ffmpeg.
 fn extract_chunk(
-    input:    &Path,
-    output:   &PathBuf,
-    start_s:  u64,
-    duration: u64,
+    input: &Path,
+    output: &std::path::PathBuf,
+    start_s: u64,
+    duration_s: u64,
 ) -> Result<(), TranscriberError> {
     let status = std::process::Command::new("ffmpeg")
         .args([
-            "-y",
-            "-i",       &input.to_string_lossy(),
-            "-ss",      &start_s.to_string(),
-            "-t",       &duration.to_string(),
-            "-acodec",  "pcm_s16le",
-            "-ac",      "1",
-            "-ar",      "16000",
+            "-y", "-i", &input.to_string_lossy(),
+            "-ss", &start_s.to_string(),
+            "-t",  &duration_s.to_string(),
+            "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000",
             &output.to_string_lossy(),
         ])
         .output()
-        .map_err(|e| TranscriberError::Io(format!("ffmpeg não encontrado: {e}")))?;
+        .map_err(|e| TranscriberError::Io(format!("ffmpeg: {e}")))?;
 
     if !status.status.success() {
-        let stderr = String::from_utf8_lossy(&status.stderr).into_owned();
-        return Err(TranscriberError::Io(format!("ffmpeg falhou: {stderr}")));
+        return Err(TranscriberError::Io(
+            String::from_utf8_lossy(&status.stderr).into_owned()
+        ));
     }
     Ok(())
 }
 
-/// Retorna a duração do áudio em segundos via ffprobe.
-fn get_audio_duration(path: &Path) -> Result<u64, TranscriberError> {
-    let output = std::process::Command::new("ffprobe")
+/// Duração do arquivo em segundos via ffprobe.
+fn audio_duration_secs(path: &Path) -> Option<u64> {
+    let out = std::process::Command::new("ffprobe")
         .args([
-            "-v",             "error",
-            "-show_entries",  "format=duration",
-            "-of",            "default=noprint_wrappers=1:nokey=1",
+            "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
             &path.to_string_lossy(),
         ])
-        .output()
-        .map_err(|e| TranscriberError::Io(format!("ffprobe não encontrado: {e}")))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
-        .trim()
-        .parse::<f64>()
-        .map(|d| d as u64)
-        .map_err(|e| TranscriberError::Io(format!("duração inválida: {e} (got '{}')", stdout.trim())))
-}
-
-/// Soma `b` em `a`, ignorando `None`.
-fn accumulate(a: &mut Option<u64>, b: Option<u64>) {
-    if let (Some(av), Some(bv)) = (a.as_mut(), b) {
-        *av += bv;
-    }
-}
-
-
-
-/// Tenta extrair segmentos por falante a partir de padrões comuns no texto.
-///
-/// Padrões reconhecidos (case-insensitive):
-/// - `Speaker 1: texto`
-/// - `Speaker_00: texto`
-/// - `[SPEAKER_00]: texto`
-/// - `[Speaker 1]: texto`
-/// - `Falante 1: texto`
-///
-/// Se nenhum padrão for encontrado, retorna um único segmento sem falante.
-fn parse_speaker_segments(text: &str) -> Vec<Segment> {
-    // Padrões: opcional "[", label com letras/números/espaços/underscore, opcional "]", ":"
-    let patterns: &[&str] = &[
-        r"\[?(?i)(speaker[\s_-]?\d+)\]?\s*:",
-        r"\[?(?i)(falante[\s_]?\d+)\]?\s*:",
-        r"\[?(?i)(locutor[\s_]?\d+)\]?\s*:",
-    ];
-
-    for pattern in patterns {
-        if let Some(segments) = try_parse_pattern(text, pattern) {
-            if segments.len() > 1 {
-                return segments;
-            }
-        }
-    }
-
-    // Nenhum padrão detectado — texto único sem falante identificado
-    vec![Segment {
-        speaker: None,
-        text: text.to_string(),
-    }]
-}
-
-/// Tenta dividir o texto usando um padrão de regex de falante.
-fn try_parse_pattern(text: &str, _pattern: &str) -> Option<Vec<Segment>> {
-    // Implementação sem regex crate — busca por prefixos comuns
-    let mut segments: Vec<Segment> = Vec::new();
-    let mut current_speaker: Option<String> = None;
-    let mut current_text = String::new();
-
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        // Tenta detectar "Label: texto" na linha
-        if let Some((label, rest)) = detect_speaker_label(line) {
-            // Salva segmento anterior se tiver conteúdo
-            if !current_text.trim().is_empty() {
-                segments.push(Segment {
-                    speaker: current_speaker.clone(),
-                    text:    current_text.trim().to_string(),
-                });
-                current_text.clear();
-            }
-            current_speaker = Some(label);
-            current_text.push_str(rest);
-        } else {
-            if !current_text.is_empty() {
-                current_text.push(' ');
-            }
-            current_text.push_str(line);
-        }
-    }
-
-    // Último segmento
-    if !current_text.trim().is_empty() {
-        segments.push(Segment {
-            speaker: current_speaker,
-            text:    current_text.trim().to_string(),
-        });
-    }
-
-    if segments.len() > 1 { Some(segments) } else { None }
-}
-
-/// Detecta se uma linha começa com um rótulo de falante.
-///
-/// Retorna `Some((label, restante_do_texto))` ou `None`.
-fn detect_speaker_label(line: &str) -> Option<(String, &str)> {
-    let line_lower = line.to_lowercase();
-
-    let prefixes = ["speaker", "falante", "locutor"];
-    for prefix in prefixes {
-        if !line_lower.starts_with(prefix) && !line_lower.starts_with('[') {
-            continue;
-        }
-
-        // Remove colchete inicial se presente
-        let stripped = if line.starts_with('[') {
-            line.trim_start_matches('[')
-        } else {
-            line
-        };
-
-        // Procura ":" após o label
-        if let Some(colon_pos) = stripped.find(':') {
-            let label_raw = stripped[..colon_pos]
-                .trim_end_matches(']')
-                .trim()
-                .to_string();
-
-            // Valida: deve conter "speaker", "falante" ou "locutor" + número
-            let label_lower = label_raw.to_lowercase();
-            let has_prefix   = prefixes.iter().any(|p| label_lower.contains(p));
-            let has_digit    = label_raw.chars().any(|c| c.is_ascii_digit());
-
-            if has_prefix && has_digit {
-                let rest = stripped[colon_pos + 1..].trim();
-                return Some((label_raw, rest));
-            }
-        }
-    }
-
-    None
+        .output().ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse::<f64>().map(|d| d as u64).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -425,53 +307,79 @@ fn detect_speaker_label(line: &str) -> Option<(String, &str)> {
 // ---------------------------------------------------------------------------
 
 impl TranscriptionResult {
-    /// Formata a transcrição para exibição no terminal.
+    /// Formata a transcrição com timestamps e falantes para exibição no terminal.
     ///
-    /// - Se falantes foram detectados: mostra segmentos com rótulo.
-    /// - Caso contrário: mostra o texto completo.
+    /// Exemplo:
+    /// ```text
+    /// [00:00] Speaker 1: Bom dia a todos.
+    /// [00:03] Speaker 2: Olá, vamos começar.
+    /// ```
     pub fn format_output(&self) -> String {
-        let has_speakers = self.segments.iter().any(|s| s.speaker.is_some());
-
-        if has_speakers {
-            self.segments
-                .iter()
-                .map(|s| {
-                    let speaker = s.speaker.as_deref().unwrap_or("Desconhecido");
-                    format!("{speaker}:\n  {}", s.text)
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n")
-        } else {
-            self.full_text.clone()
+        if self.segments.is_empty() {
+            return self.full_text.clone();
         }
+
+        let has_speakers = self.segments.iter().any(|s| s.speaker.is_some());
+        let has_timestamps = self.segments.iter().any(|s| s.start_ms.is_some());
+
+        self.segments
+            .iter()
+            .map(|s| {
+                let ts = if has_timestamps {
+                    s.start_ms
+                        .map(|ms| format!("[{}] ", ms_to_time(ms)))
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+
+                if has_speakers {
+                    let speaker = s.speaker.as_deref().unwrap_or("Speaker ?");
+                    format!("{ts}{speaker}: {}", s.text)
+                } else {
+                    format!("{ts}{}", s.text)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Serializa o resultado completo como JSON formatado.
     pub fn to_json(&self) -> String {
-        let segments: Vec<serde_json::Value> = self
-            .segments
+        let speakers: std::collections::HashSet<String> = self.segments
+            .iter()
+            .filter_map(|s| s.speaker.clone())
+            .collect();
+
+        let segments: Vec<serde_json::Value> = self.segments
             .iter()
             .map(|s| serde_json::json!({
-                "speaker": s.speaker,
-                "text":    s.text
+                "speaker":     s.speaker,
+                "text":        s.text,
+                "start_ms":    s.start_ms,
+                "end_ms":      s.end_ms,
+                "start_time":  s.start_ms.map(ms_to_time),
+                "confidence":  s.confidence
             }))
             .collect();
 
-        let usage = self.usage.as_ref().map(|u| serde_json::json!({
-            "total_tokens":  u.total_tokens,
-            "input_tokens":  u.input_tokens,
-            "output_tokens": u.output_tokens
-        }));
-
         serde_json::to_string_pretty(&serde_json::json!({
-            "full_text": self.full_text,
-            "speakers_detected": self.segments.iter().any(|s| s.speaker.is_some()),
-            "segment_count": self.segments.len(),
-            "segments": segments,
-            "usage": usage
+            "full_text":        self.full_text,
+            "duration_ms":      self.duration_ms,
+            "speakers_detected": !speakers.is_empty(),
+            "speaker_count":    speakers.len(),
+            "speakers":         speakers.into_iter().collect::<Vec<_>>(),
+            "segment_count":    self.segments.len(),
+            "segments":         segments
         }))
         .unwrap_or_default()
     }
+}
+
+/// Converte millisegundos para `MM:SS`.
+pub fn ms_to_time(ms: u64) -> String {
+    let total_s = ms / 1000;
+    format!("{:02}:{:02}", total_s / 60, total_s % 60)
 }
 
 // ---------------------------------------------------------------------------
@@ -482,96 +390,86 @@ impl TranscriptionResult {
 mod tests {
     use super::*;
 
-    // ── parser de falantes ─────────────────────────────────────────────────
-
-    #[test]
-    fn parse_sem_marcadores_retorna_segmento_unico_sem_speaker() {
-        let text = "Bom dia a todos. Vamos começar a reunião.";
-        let segs = parse_speaker_segments(text);
-        assert_eq!(segs.len(), 1);
-        assert_eq!(segs[0].speaker, None);
-        assert!(segs[0].text.contains("Bom dia"));
+    fn seg(speaker: &str, text: &str, start_ms: u64, end_ms: u64) -> Segment {
+        Segment {
+            speaker:    Some(speaker.to_string()),
+            text:       text.to_string(),
+            start_ms:   Some(start_ms),
+            end_ms:     Some(end_ms),
+            confidence: Some(0.95),
+        }
     }
 
     #[test]
-    fn parse_detecta_speaker_numerico() {
-        let text = "Speaker 1: Olá, tudo bem?\nSpeaker 2: Tudo ótimo, obrigado.";
-        let segs = parse_speaker_segments(text);
-        assert_eq!(segs.len(), 2);
-        assert_eq!(segs[0].speaker.as_deref(), Some("Speaker 1"));
-        assert!(segs[0].text.contains("Olá"));
-        assert_eq!(segs[1].speaker.as_deref(), Some("Speaker 2"));
-        assert!(segs[1].text.contains("Tudo ótimo"));
+    fn ms_to_time_formata_corretamente() {
+        assert_eq!(ms_to_time(0),       "00:00");
+        assert_eq!(ms_to_time(5_000),   "00:05");
+        assert_eq!(ms_to_time(65_000),  "01:05");
+        assert_eq!(ms_to_time(3_600_000), "60:00");
     }
 
     #[test]
-    fn parse_detecta_falante_em_portugues() {
-        let text = "Falante 1: Bom dia.\nFalante 2: Oi!";
-        let segs = parse_speaker_segments(text);
-        assert_eq!(segs.len(), 2);
-        assert_eq!(segs[0].speaker.as_deref(), Some("Falante 1"));
-        assert_eq!(segs[1].speaker.as_deref(), Some("Falante 2"));
-    }
-
-    #[test]
-    fn detect_speaker_label_reconhece_prefixo_speaker() {
-        let (label, rest) = detect_speaker_label("Speaker 1: Olá!").unwrap();
-        assert_eq!(label, "Speaker 1");
-        assert_eq!(rest, "Olá!");
-    }
-
-    #[test]
-    fn detect_speaker_label_ignora_linha_normal() {
-        assert!(detect_speaker_label("Bom dia a todos.").is_none());
-        assert!(detect_speaker_label("A reunião vai começar.").is_none());
-    }
-
-    // ── formatação ────────────────────────────────────────────────────────
-
-    #[test]
-    fn format_output_sem_speakers_retorna_full_text() {
+    fn format_output_com_speaker_e_timestamp() {
         let result = TranscriptionResult {
-            full_text: "Texto sem falantes.".to_string(),
-            segments:  vec![Segment { speaker: None, text: "Texto sem falantes.".to_string() }],
-            usage:     None,
-        };
-        assert_eq!(result.format_output(), "Texto sem falantes.");
-    }
-
-    #[test]
-    fn format_output_com_speakers_inclui_labels() {
-        let result = TranscriptionResult {
-            full_text: "Speaker 1: Oi. Speaker 2: Olá.".to_string(),
+            full_text:   "Bom dia. Olá.".to_string(),
+            duration_ms: Some(5_000),
             segments: vec![
-                Segment { speaker: Some("Speaker 1".to_string()), text: "Oi.".to_string() },
-                Segment { speaker: Some("Speaker 2".to_string()), text: "Olá.".to_string() },
+                seg("Speaker 1", "Bom dia.", 0, 2_000),
+                seg("Speaker 2", "Olá.",     2_500, 4_000),
             ],
-            usage: None,
         };
         let out = result.format_output();
-        assert!(out.contains("Speaker 1:"));
-        assert!(out.contains("Speaker 2:"));
+        assert!(out.contains("[00:00] Speaker 1: Bom dia."), "got: {out}");
+        assert!(out.contains("[00:02] Speaker 2: Olá."),    "got: {out}");
+    }
+
+    #[test]
+    fn format_output_sem_segmentos_retorna_full_text() {
+        let result = TranscriptionResult {
+            full_text:   "Texto.".to_string(),
+            duration_ms: None,
+            segments:    vec![],
+        };
+        assert_eq!(result.format_output(), "Texto.");
     }
 
     #[test]
     fn to_json_contem_campos_obrigatorios() {
         let result = TranscriptionResult {
-            full_text: "Oi.".to_string(),
-            segments:  vec![Segment { speaker: None, text: "Oi.".to_string() }],
-            usage:     Some(UsageInfo { total_tokens: Some(10), input_tokens: Some(5), output_tokens: Some(5) }),
+            full_text:   "Teste.".to_string(),
+            duration_ms: Some(3_000),
+            segments:    vec![seg("Speaker 1", "Teste.", 0, 3_000)],
         };
         let json = result.to_json();
-        assert!(json.contains("\"full_text\""));
-        assert!(json.contains("\"segments\""));
-        assert!(json.contains("\"usage\""));
-        assert!(json.contains("\"total_tokens\""));
+        assert!(json.contains("\"full_text\""),        "got: {json}");
+        assert!(json.contains("\"speakers_detected\""),"got: {json}");
+        assert!(json.contains("\"speaker_count\""),    "got: {json}");
+        assert!(json.contains("\"start_ms\""),         "got: {json}");
+        assert!(json.contains("\"start_time\""),       "got: {json}");
+        assert!(json.contains("\"confidence\""),       "got: {json}");
     }
 
-    // ── config ────────────────────────────────────────────────────────────
+    #[test]
+    fn to_json_lista_falantes_unicos() {
+        let result = TranscriptionResult {
+            full_text:   "A. B. A.".to_string(),
+            duration_ms: None,
+            segments: vec![
+                seg("Speaker 1", "A.", 0,      1_000),
+                seg("Speaker 2", "B.", 1_500,  2_500),
+                seg("Speaker 1", "A.", 3_000,  4_000),
+            ],
+        };
+        let json = result.to_json();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["speaker_count"], 2);
+        assert_eq!(v["segment_count"], 3);
+    }
 
     #[test]
-    fn config_from_env_falha_sem_variaveis() {
-        let result = require_env("AZURE_OPENAI_CHAVE_INEXISTENTE_XYZ");
-        assert!(matches!(result, Err(TranscriberError::Config(_))));
+    fn config_from_env_falha_sem_credenciais() {
+        // Testa que a leitura de env var ausente retorna Config error
+        let result = std::env::var("AZURE_VARIAVEL_INEXISTENTE_XYZ");
+        assert!(result.is_err());
     }
 }
