@@ -107,19 +107,20 @@ flowchart LR
 
 ### Etapa 1 — Bandpass (HPF + LPF)
 
-**Filtro:** `highpass=f=100,lowpass=f=16000`
+**Filtro:** `highpass=f=100,lowpass=f=8000`
 
 **O que é:**
-Filtro de banda que deixa passar apenas as frequências entre 100 Hz e 16 000 Hz,
+Filtro de banda que deixa passar apenas as frequências entre 100 Hz e 8 000 Hz,
 bloqueando tudo fora dessa faixa.
 
 **Por que:**
 - **HPF (100 Hz):** elimina ruídos de baixíssima frequência — vibração de mesa,
   ar-condicionado, tráfego — que não fazem parte da fala mas ocupam energia
   desnecessária no sinal.
-- **LPF (16 000 Hz):** remove chiados e ruídos de alta frequência acima da faixa
-  vocal útil. A fala humana vai até ~8 kHz; 16 kHz é o limite da taxa de
-  amostragem do WAV de saída.
+- **LPF (8 000 Hz):** remove chiados e ruídos de alta frequência acima da faixa
+  vocal útil. A fala humana vai até ~8 kHz; como o WAV de saída é gerado a
+  16 kHz, o Nyquist é **8 000 Hz** — um LPF acima disso seria eliminado pelo
+  resampler antes de ter qualquer efeito.
 - Reduz o volume de dados que os filtros posteriores precisam processar.
 
 **Posição na chain:** primeiro, para que todos os filtros seguintes operem
@@ -128,7 +129,7 @@ sobre um sinal já limpo nas extremidades.
 | Parâmetro | Padrão | Descrição |
 |---|---|---|
 | `hpf_hz` | `100` | Frequência de corte do passa-altas |
-| `lpf_hz` | `16000` | Frequência de corte do passa-baixas |
+| `lpf_hz` | `8000` | Frequência de corte do passa-baixas (≤ Nyquist do sample rate de saída) |
 
 ---
 
@@ -157,7 +158,7 @@ das amostras ao redor.
 
 ### Etapa 2b — Redução de Ruído FFT (`afftdn`)
 
-**Filtro:** `afftdn=nf=-25`
+**Filtro:** `afftdn=nf=-35`
 
 **O que é:**
 Analisa o espectro de frequência do áudio por janelas FFT e atenua
@@ -172,9 +173,13 @@ remove sem tocar na fala, que é dinâmica.
 **Complementa** o `anlmdn` da etapa seguinte: o FFT é eficiente em ruído
 estacionário, o NLM é eficiente em ruído variável.
 
+> **Calibração:** o valor `-35` é adequado para capturas OBS em ambiente
+> controlado. Para gravações com ruído de fundo elevado, use valores menos
+> negativos (ex.: `-20`); para ambientes muito silenciosos, pode ir até `-45`.
+
 | Parâmetro | Padrão | Descrição |
 |---|---|---|
-| `noise_floor_db` | `-25` | Piso de ruído estimado em dBFS — menor = menos agressivo |
+| `noise_floor_db` | `-35` | Piso de ruído estimado em dBFS — menor valor = mais agressivo |
 
 ---
 
@@ -235,12 +240,12 @@ as pistas de inteligibilidade da fala humana. Realçar esta faixa:
 
 ### Etapa 4a — Compressão Dinâmica (`acompressor`)
 
-**Filtro:** `acompressor=threshold=-18dB:ratio=3:attack=5:release=50:makeup=2dB`
+**Filtro:** `acompressor=threshold=-24dB:ratio=2:attack=5:release=50:makeup=2dB`
 
 **O que é:**
 Compressor de dinâmica que reduz a diferença entre os trechos mais altos e
-mais baixos do áudio. Quando o sinal ultrapassa `-18 dBFS`, a taxa de
-compressão 3:1 reduz o ganho acima do limiar.
+mais baixos do áudio. Quando o sinal ultrapassa `-24 dBFS`, a taxa de
+compressão 2:1 reduz o ganho acima do limiar.
 
 **Por que:**
 - A fala natural tem dinâmica ampla: sílabas tônicas podem ser 20 dB mais
@@ -252,11 +257,14 @@ compressão 3:1 reduz o ganho acima do limiar.
   o nível geral próximo ao original.
 - `attack=5ms` e `release=50ms`: rápido o suficiente para reagir a picos,
   mas lento o suficiente para não distorcer consoantes plosivas.
+- O threshold mais baixo (`-24` vs `-18`) e a ratio mais suave (`2:1` vs
+  `3:1`) evitam **double-compression** com o `dynaudnorm` da etapa seguinte,
+  preservando naturalidade em fala com dicção variada.
 
 | Parâmetro | Padrão | Descrição |
 |---|---|---|
-| `compress_threshold_db` | `-18` | Limiar de início da compressão em dBFS |
-| `compress_ratio` | `3.0` | Taxa de compressão (3:1 = cada 3 dB acima vira 1 dB) |
+| `compress_threshold_db` | `-24` | Limiar de início da compressão em dBFS |
+| `compress_ratio` | `2.0` | Taxa de compressão (2:1 = cada 2 dB acima vira 1 dB) |
 | `compress_makeup_db` | `2.0` | Ganho de compensação pós-compressão |
 
 ---
@@ -292,7 +300,7 @@ configurada.
 
 ### Etapa 5a — Normalização de Loudness (`dynaudnorm`)
 
-**Filtro:** `dynaudnorm=p=0.9:m=100:r=0.9:maxgain=15`
+**Filtro:** `dynaudnorm=p=0.7:m=100:r=0.5:maxgain=15`
 
 **O que é:**
 Dynamic Audio Normalizer — aplica um ganho variável ao longo do tempo para
@@ -306,6 +314,12 @@ perceptível.
   consistente, independente da gravação original.
 - Usa `maxgain=15` para limitar ganhos excessivos em trechos muito baixos
   (o que amplificaria o ruído residual junto com a fala).
+- `p=0.7` (≈ -3.1 dBFS) deixa headroom seguro para evitar picos próximos
+  a 0 dBFS que causam clipping em decoders downstream.
+- `r=0.5` controla o target crest factor do normalizador. O valor anterior
+  `0.9` causava variações de ganho muito rápidas entre frames (*pumping*),
+  aumentando o LRA de 5.5 LU para 10.6 LU no arquivo processado. Com `0.5`
+  as transições são mais suaves e o LRA se mantém próximo ao original.
 - **Por que não `loudnorm`?** O filtro EBU R128 (`loudnorm`) requer dois
   passes completos pelo arquivo — o segundo passe usa estatísticas do primeiro
   para ajustar o ganho. Em arquivos longos (> 10 min) isso causa travamento
@@ -313,14 +327,14 @@ perceptível.
 
 | Parâmetro | Padrão | Descrição |
 |---|---|---|
-| `loudnorm_peak` | `0.9` | Nível de pico alvo (0.0–1.0 ≈ -0.9 dBFS) |
+| `loudnorm_peak` | `0.7` | Nível de pico alvo (0.0–1.0 ≈ -3.1 dBFS) |
 | `loudnorm_max_gain` | `15.0` | Ganho máximo aplicável em dB |
 
 ---
 
 ### Etapa 5b — Limiter (`alimiter`)
 
-**Filtro:** `alimiter=limit=0.9:attack=5:release=50:level=disabled`
+**Filtro:** `alimiter=limit=0.7:attack=5:release=50:level=disabled`
 
 **O que é:**
 Limitador lookahead que impede que qualquer amostra ultrapasse o nível
@@ -335,6 +349,9 @@ de picos acontecerem.
 - O limiter é a **proteção final** da cadeia: garante que o arquivo entregue
   ao STT nunca sature, sem distorcer a fala (5ms de lookahead é invisível
   perceptualmente).
+- `limit=0.7` (≈ -3.1 dBFS) é alinhado com `loudnorm_peak=0.7`, garantindo
+  que a proteção seja efetiva — um limiter com valor maior que o pico alvo
+  da normalização nunca seria acionado.
 - `level=disabled` evita que o alimiter reprocesse o ganho de saída,
   mantendo o nível definido pelo `dynaudnorm`.
 - **Opcional:** desabilitar com `enable_limiter: false` em sinais já
@@ -343,7 +360,7 @@ de picos acontecerem.
 | Parâmetro | Padrão | Descrição |
 |---|---|---|
 | `enable_limiter` | `true` | Liga/desliga esta etapa |
-| `limiter_limit` | `0.9` | Pico máximo permitido (≈ -0.9 dBFS) |
+| `limiter_limit` | `0.7` | Pico máximo permitido (≈ -3.1 dBFS) |
 | `limiter_attack_ms` | `5.0` | Tempo de antecipação em ms |
 | `limiter_release_ms` | `50.0` | Tempo de recuperação em ms |
 
@@ -351,7 +368,7 @@ de picos acontecerem.
 
 ### Etapa 6 — Remoção de Silêncios / VAD (`silenceremove`)
 
-**Filtro:** `silenceremove=stop_periods=-1:stop_silence=0.3:stop_threshold=-50dB`
+**Filtro:** `silenceremove=stop_periods=-1:stop_silence=0.8:stop_threshold=-50dB`
 
 **O que é:**
 Voice Activity Detection (VAD) — detecta trechos de silêncio prolongados
@@ -361,8 +378,10 @@ e os remove do arquivo final.
 - Vídeos de reunião, aulas e entrevistas têm longas pausas entre falas
   que aumentam o tamanho do arquivo e o tempo de inferência do STT sem
   acrescentar informação.
-- Remover silêncios de mais de 0.3s reduz o arquivo (neste projeto, de
-  ~71 MB para ~67 MB em um vídeo de 38 minutos) e acelera o STT.
+- Remover silêncios de mais de 0.8s reduz o arquivo e acelera o STT sem
+  cortar pausas naturais de fala — respirações e hesitações ficam entre
+  0.2 e 0.7 s e são importantes para o modelo delimitar sentenças.
+  O valor anterior de 0.3 s cortava ~2 s a mais por arquivo de 26 s.
 
 **Limitação do ffmpeg 7.x:**
 
@@ -381,7 +400,7 @@ silencioso no ffmpeg 7.x (comportamento confirmado em testes).
 | Parâmetro | Padrão | Descrição |
 |---|---|---|
 | `silence_threshold_db` | `-50` | Limiar de silêncio em dBFS |
-| `silence_min_duration_s` | `0.3` | Duração mínima para remoção em segundos |
+| `silence_min_duration_s` | `0.8` | Duração mínima para remoção em segundos |
 
 ---
 
@@ -417,11 +436,11 @@ let config = AudioProcessingConfig {
 | Campo | Padrão | Etapa | Descrição |
 |---|---|---|---|
 | `hpf_hz` | `100` | Bandpass | Frequência de corte HPF em Hz |
-| `lpf_hz` | `16000` | Bandpass | Frequência de corte LPF em Hz |
+| `lpf_hz` | `8000` | Bandpass | Frequência de corte LPF em Hz (≤ Nyquist do sample rate de saída) |
 | `enable_click_removal` | `true` | Click Removal | Liga/desliga `adeclick` |
 | `click_window_ms` | `55.0` | Click Removal | Janela de análise em ms |
 | `click_overlap_pct` | `75` | Click Removal | Sobreposição em % (50–95) |
-| `noise_floor_db` | `-25` | Noise FFT | Piso de ruído para `afftdn` |
+| `noise_floor_db` | `-35` | Noise FFT | Piso de ruído para `afftdn` |
 | `enable_nlmeans` | `true` | Noise NLM | Liga/desliga `anlmdn` |
 | `nlmeans_strength` | `7.0` | Noise NLM | Força de denoising (1–100) |
 | `nlmeans_patch_radius_s` | `0.002` | Noise NLM | Raio do patch em segundos |
@@ -430,21 +449,21 @@ let config = AudioProcessingConfig {
 | `voice_eq_freq_hz` | `3000` | Voice EQ | Frequência central do realce |
 | `voice_eq_gain_db` | `3.0` | Voice EQ | Ganho do realce em dB |
 | `voice_eq_bandwidth_hz` | `2000` | Voice EQ | Largura de banda em Hz |
-| `compress_threshold_db` | `-18` | Compression | Limiar de compressão em dBFS |
-| `compress_ratio` | `3.0` | Compression | Taxa de compressão |
+| `compress_threshold_db` | `-24` | Compression | Limiar de compressão em dBFS |
+| `compress_ratio` | `2.0` | Compression | Taxa de compressão |
 | `compress_makeup_db` | `2.0` | Compression | Ganho de makeup em dB |
 | `enable_noise_gate` | `true` | Noise Gate | Liga/desliga `agate` |
 | `gate_threshold` | `0.01` | Noise Gate | Limiar de abertura (linear) |
 | `gate_ratio` | `10.0` | Noise Gate | Taxa de atenuação abaixo do limiar |
 | `gate_knee` | `2.828` | Noise Gate | Suavidade da transição em dB |
-| `loudnorm_peak` | `0.9` | Loudness | Pico alvo do `dynaudnorm` |
+| `loudnorm_peak` | `0.7` | Loudness | Pico alvo do `dynaudnorm` (≈ -3.1 dBFS) |
 | `loudnorm_max_gain` | `15.0` | Loudness | Ganho máximo em dB |
 | `enable_limiter` | `true` | Limiter | Liga/desliga `alimiter` |
-| `limiter_limit` | `0.9` | Limiter | Pico máximo permitido |
+| `limiter_limit` | `0.7` | Limiter | Pico máximo permitido (≈ -3.1 dBFS) |
 | `limiter_attack_ms` | `5.0` | Limiter | Lookahead em ms |
 | `limiter_release_ms` | `50.0` | Limiter | Recuperação em ms |
 | `silence_threshold_db` | `-50` | VAD | Limiar de silêncio em dBFS |
-| `silence_min_duration_s` | `0.3` | VAD | Duração mínima de silêncio a remover |
+| `silence_min_duration_s` | `0.8` | VAD | Duração mínima de silêncio a remover |
 
 ---
 
@@ -474,8 +493,8 @@ independente do áudio original:
 | **Canais** | 1 (mono) |
 | **Taxa de amostragem** | 16 000 Hz |
 | **Bit depth** | 16 bits |
-| **Loudness alvo** | ≈ -17 LUFS |
-| **Pico máximo** | ≈ 0.4 dBFS |
+| **Loudness alvo** | ≈ -23 LUFS (EBU R128) |
+| **Pico máximo** | ≈ -3.1 dBFS |
 
 Esses valores são compatíveis com os requisitos de entrada dos principais
 modelos de STT (Whisper, Wav2Vec 2.0, DeepSpeech, Vosk).
