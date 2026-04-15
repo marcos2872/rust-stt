@@ -4,3 +4,4 @@ data/
 temp/*
 !temp/.gitkeep
 .obsidian/
+.env
