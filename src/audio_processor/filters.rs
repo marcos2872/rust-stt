@@ -11,6 +11,10 @@
 ///
 /// Remove frequências abaixo de `hpf_hz` (ruído de baixa frequência, vibração)
 /// e acima de `lpf_hz` (chiado de alta frequência desnecessário para fala).
+///
+/// > **Atenção**: `lpf_hz` deve ser ≤ Nyquist do sample rate de saída.
+/// > Para saída em 16 kHz o limite é **8 000 Hz** — valores maiores serão
+/// > cortados pelo resampler antes do filtro ter efeito.
 pub fn bandpass(hpf_hz: u32, lpf_hz: u32) -> String {
     format!("highpass=f={hpf_hz},lowpass=f={lpf_hz}")
 }
@@ -101,7 +105,7 @@ pub fn noise_gate(threshold: f32, ratio: f32, knee: f32) -> String {
 /// > Nota: `loudnorm` (EBU R128 two-pass) não é usado aqui pois requer dois
 /// > passes completos e pode travar em single-pass com arquivos longos.
 pub fn loudness_normalization(peak: f32, max_gain: f32) -> String {
-    format!("dynaudnorm=p={peak}:m=100:r=0.9:maxgain={max_gain}")
+    format!("dynaudnorm=p={peak}:m=100:r=0.5:maxgain={max_gain}")
 }
 
 /// **Etapa 5b — Limiter**: Limitador lookahead para controlar picos residuais.
@@ -197,8 +201,9 @@ mod tests {
     fn loudness_normalization_usa_dynaudnorm() {
         let f = loudness_normalization(0.9, 15.0);
         assert!(f.contains("dynaudnorm"), "deve usar dynaudnorm: {f}");
-        assert!(f.contains("p=0.9"), "peak incorreto: {f}");
+        assert!(f.contains("p=0.9"),      "peak incorreto: {f}");
         assert!(f.contains("maxgain=15"), "maxgain incorreto: {f}");
+        assert!(f.contains("r=0.5"),      "crest factor target incorreto: {f}");
     }
 
     #[test]

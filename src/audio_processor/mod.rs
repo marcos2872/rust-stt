@@ -51,7 +51,9 @@ pub struct AudioProcessingConfig {
     // ── Etapa 1 — Bandpass ─────────────────────────────────────────────────
     /// Frequência de corte do HPF em Hz (padrão: 100 Hz).
     pub hpf_hz: u32,
-    /// Frequência de corte do LPF em Hz (padrão: 16 000 Hz).
+    /// Frequência de corte do LPF em Hz (padrão: 8 000 Hz).
+    /// Deve ser ≤ Nyquist do sample rate de saída (16 kHz → 8 kHz);
+    /// valores acima disso são cortados pelo resampler antes de o filtro agir.
     pub lpf_hz: u32,
 
     // ── Etapa 2a — Click Removal ───────────────────────────────────────────
@@ -132,13 +134,13 @@ impl Default for AudioProcessingConfig {
         Self {
             // Bandpass
             hpf_hz: 100,
-            lpf_hz: 16_000,
+            lpf_hz: 8_000,
             // Click removal
             enable_click_removal: true,
             click_window_ms: 55.0,
             click_overlap_pct: 75,
             // Noise reduction FFT
-            noise_floor_db: -25,
+            noise_floor_db: -35,
             // Noise reduction NLM
             enable_nlmeans: true,
             nlmeans_strength: 7.0,
@@ -150,8 +152,8 @@ impl Default for AudioProcessingConfig {
             voice_eq_gain_db: 3.0,
             voice_eq_bandwidth_hz: 2_000,
             // Compression
-            compress_threshold_db: -18,
-            compress_ratio: 3.0,
+            compress_threshold_db: -24,
+            compress_ratio: 2.0,
             compress_makeup_db: 2.0,
             // Noise gate
             enable_noise_gate: true,
@@ -159,16 +161,16 @@ impl Default for AudioProcessingConfig {
             gate_ratio: 10.0,
             gate_knee: 2.828,
             // Loudness normalization
-            loudnorm_peak: 0.9,
+            loudnorm_peak: 0.7,
             loudnorm_max_gain: 15.0,
             // Limiter
             enable_limiter: true,
-            limiter_limit: 0.9,
+            limiter_limit: 0.7,
             limiter_attack_ms: 5.0,
             limiter_release_ms: 50.0,
             // Silence removal
             silence_threshold_db: -50,
-            silence_min_duration_s: 0.3,
+            silence_min_duration_s: 0.8,
         }
     }
 }
@@ -467,12 +469,12 @@ mod tests {
         };
         let chain = build_filter_chain(&config);
 
-        assert!(chain.contains("f=150"),        "HPF customizado ausente: {chain}");
-        assert!(chain.contains("nf=-30"),        "noise floor customizado ausente: {chain}");
-        assert!(chain.contains("s=10"),          "nlmeans strength ausente: {chain}");
+        assert!(chain.contains("f=150"),         "HPF customizado ausente: {chain}");
+        assert!(chain.contains("nf=-30"),         "noise floor customizado ausente: {chain}");
+        assert!(chain.contains("s=10"),           "nlmeans strength ausente: {chain}");
         assert!(chain.contains("threshold=0.02"), "gate threshold ausente: {chain}");
-        assert!(chain.contains("p=0.8"),         "loudnorm peak ausente: {chain}");
-        assert!(chain.contains("limit=0.85"),    "limiter limit ausente: {chain}");
+        assert!(chain.contains("p=0.8"),          "loudnorm peak ausente: {chain}");
+        assert!(chain.contains("limit=0.85"),     "limiter limit ausente: {chain}");
     }
 
     #[test]
