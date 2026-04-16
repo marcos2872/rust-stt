@@ -79,6 +79,8 @@ pub struct SummaryResult {
     pub action_items: Vec<String>,
     /// Decisões tomadas.
     pub key_decisions: Vec<String>,
+    /// Uso de tokens reportado pela Azure OpenAI.
+    pub token_usage: llm::TokenUsage,
 }
 
 /// Um segmento da transcrição com nome real do falante.
@@ -168,7 +170,7 @@ pub fn summarize(
 
     // 6. Chama o LLM
     eprintln!("Chamando {} para confirmar mapeamento e gerar resumo...", config.deployment);
-    let llm_response = llm::complete(&system_prompt, &user_prompt, config)?;
+    let (llm_response, token_usage) = llm::complete(&system_prompt, &user_prompt, config)?;
 
     // 7. Parseia a resposta do LLM
     let llm_json: serde_json::Value = serde_json::from_str(&llm_response)
@@ -195,6 +197,7 @@ pub fn summarize(
         summary,
         action_items,
         key_decisions,
+        token_usage,
     })
 }
 
@@ -407,6 +410,11 @@ impl SummaryResult {
             "action_items":     self.action_items,
             "key_decisions":    self.key_decisions,
             "segment_count":    self.transcript.len(),
+            "token_usage": {
+                "prompt_tokens":     self.token_usage.prompt_tokens,
+                "completion_tokens": self.token_usage.completion_tokens,
+                "total_tokens":      self.token_usage.total_tokens,
+            },
             "transcript":       transcript
         }))
         .unwrap_or_default()
@@ -458,6 +466,7 @@ mod tests {
             summary:         "Reunião produtiva.".to_string(),
             action_items:    vec!["Fulano: enviar relatório".to_string()],
             key_decisions:   vec!["Manter estrutura atual".to_string()],
+            token_usage:     llm::TokenUsage::default(),
         };
         let json = result.to_json();
         assert!(json.contains("speaker_mapping"));

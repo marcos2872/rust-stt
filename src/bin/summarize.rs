@@ -12,6 +12,10 @@
 use std::path::Path;
 use std::process;
 
+// Preços Azure OpenAI gpt-5.4-mini
+const PRICE_INPUT_PER_1M: f64 = 0.750; // USD por 1M tokens de entrada
+const PRICE_OUTPUT_PER_1M: f64 = 4.500; // USD por 1M tokens de saída
+
 fn main() {
     dotenvy::dotenv().ok();
 
@@ -37,15 +41,17 @@ fn main() {
 fn run(transcript_path: &Path, vtt_path: &Path) -> Result<(), String> {
     // ── Validação ─────────────────────────────────────────────────────────
     if !transcript_path.exists() {
-        return Err(format!("transcript não encontrado: {}", transcript_path.display()));
+        return Err(format!(
+            "transcript não encontrado: {}",
+            transcript_path.display()
+        ));
     }
     if !vtt_path.exists() {
         return Err(format!("VTT não encontrado: {}", vtt_path.display()));
     }
 
     // ── Configuração ──────────────────────────────────────────────────────
-    let config = rust_stt::summarizer::SummarizerConfig::from_env()
-        .map_err(|e| e.to_string())?;
+    let config = rust_stt::summarizer::SummarizerConfig::from_env().map_err(|e| e.to_string())?;
 
     println!("Summarizer — Azure OpenAI + Teams VTT");
     println!("  Transcript : {}", transcript_path.display());
@@ -55,13 +61,15 @@ fn run(transcript_path: &Path, vtt_path: &Path) -> Result<(), String> {
     println!();
 
     // ── Pré-visualização do VTT ───────────────────────────────────────────
-    let vtt_content = std::fs::read_to_string(vtt_path)
-        .map_err(|e| format!("Falha ao ler VTT: {e}"))?;
+    let vtt_content =
+        std::fs::read_to_string(vtt_path).map_err(|e| format!("Falha ao ler VTT: {e}"))?;
     let vtt_entries = rust_stt::summarizer::vtt::parse(&vtt_content);
 
     // Conta participantes únicos
     let mut participants: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for e in &vtt_entries { participants.insert(&e.name); }
+    for e in &vtt_entries {
+        participants.insert(&e.name);
+    }
     let mut sorted_participants: Vec<&&str> = participants.iter().collect();
     sorted_participants.sort();
 
@@ -72,13 +80,16 @@ fn run(transcript_path: &Path, vtt_path: &Path) -> Result<(), String> {
     println!();
 
     // ── Execução ──────────────────────────────────────────────────────────
-    let start  = std::time::Instant::now();
+    let start = std::time::Instant::now();
     let result = rust_stt::summarizer::summarize(transcript_path, vtt_path, &config)
         .map_err(|e| e.to_string())?;
     let elapsed = start.elapsed();
 
     // ── Mapeamento identificado ───────────────────────────────────────────
-    println!("Mapeamento de falantes (tempo: {:.1}s)", elapsed.as_secs_f64());
+    println!(
+        "Mapeamento de falantes (tempo: {:.1}s)",
+        elapsed.as_secs_f64()
+    );
     let mut mapping: Vec<(&String, &String)> = result.speaker_mapping.iter().collect();
     mapping.sort_by_key(|(k, _)| k.as_str());
     for (speaker, name) in &mapping {
@@ -110,12 +121,40 @@ fn run(transcript_path: &Path, vtt_path: &Path) -> Result<(), String> {
         }
     }
 
-    // ── Transcrição com nomes ─────────────────────────────────────────────
+    // ── Tokens e custo estimado ───────────────────────────────────────────
+    let usage = &result.token_usage;
+    let cost_in = usage.prompt_tokens as f64 / 1_000_000.0 * PRICE_INPUT_PER_1M;
+    let cost_out = usage.completion_tokens as f64 / 1_000_000.0 * PRICE_OUTPUT_PER_1M;
+    let cost_total = cost_in + cost_out;
+
     println!();
     println!("{}", "─".repeat(60));
-    println!("TRANSCRICAO ({} segmentos)", result.transcript.len());
+    println!("USO DE TOKENS (Azure OpenAI)");
     println!("{}", "─".repeat(60));
-    println!("{}", result.format_output());
+    println!(
+        "  Entrada  : {:>8} tokens   (${:.6})",
+        usage.prompt_tokens, cost_in
+    );
+    println!(
+        "  Saída    : {:>8} tokens   (${:.6})",
+        usage.completion_tokens, cost_out
+    );
+    println!(
+        "  Total    : {:>8} tokens   (${:.6})",
+        usage.total_tokens, cost_total
+    );
+    println!(
+        "  (preços: ${}/1M entrada · ${}/1M saída — gpt-5.4-mini)",
+        PRICE_INPUT_PER_1M, PRICE_OUTPUT_PER_1M
+    );
+
+    // ── Transcrição ───────────────────────────────────────────────────────
+    println!();
+    println!("{}", "─".repeat(60));
+    println!(
+        "TRANSCRICAO ({} segmentos — salvo no JSON)",
+        result.transcript.len()
+    );
     println!("{}", "─".repeat(60));
 
     // ── Salvar JSON ───────────────────────────────────────────────────────
