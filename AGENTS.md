@@ -5,13 +5,13 @@
 ## Projeto
 
 - **Nome:** rust-stt
-- **Descrição:** Pipeline de Speech-to-Text em Rust que converte MP4 → WAV, aplica uma cadeia de 9 filtros de áudio via ffmpeg e transcreve com diarização de falantes usando o Azure OpenAI (`gpt-4o-transcribe-diarize`).
+- **Descrição:** Pipeline em Rust para preparar e transcrever áudio de vídeos MP4 usando Azure. Converte MP4 → WAV, aplica 9 etapas de filtragem de áudio via ffmpeg, transcreve com diarização de falantes via Azure AI Speech (`Fast Transcription API`) e gera resumo executivo identificando falantes reais via Azure OpenAI + VTT do Teams.
 
 ## Stack
 
 - **Linguagem(s):** Rust (edition 2024)
 - **Frameworks:** —
-- **Dependências principais:** `reqwest 0.12` (HTTP multipart/JSON), `serde 1` + `serde_json 1` (serialização), `dotenvy 0.15` (variáveis de ambiente)
+- **Dependências principais:** `reqwest 0.12` (HTTP multipart/JSON, blocking), `serde 1` + `serde_json 1` (serialização), `dotenvy 0.15` (variáveis de ambiente)
 - **Dependências de sistema:** `ffmpeg` e `ffprobe` (devem estar no PATH)
 
 ## Gerenciamento de Dependências
@@ -24,44 +24,52 @@
 
 - **Testes:** `cargo test`
 - **Build:** `cargo build --release`
-- **Rodar pipeline (MP4 → WAV processado):** `cargo run --bin pipeline -- <arquivo.mp4>`
-- **Rodar transcrição (WAV → texto):** `cargo run --bin transcribe -- <arquivo.wav>`
+- **Pipeline (MP4 → WAV processado):** `cargo run --bin pipeline -- <arquivo.mp4>`
+- **Transcrição (WAV → JSON):** `cargo run --bin transcribe -- <arquivo.wav>`
+- **Summarizer (transcript.json + VTT → resumo):** `cargo run --bin summarize -- <transcript.json> <meeting.vtt>`
 
 ## Estrutura de Diretórios
 
 - **Código principal:** `src/`
 - **Testes:** embutidos nos módulos via `#[cfg(test)]` (não há diretório `tests/` separado)
 - **Dados de exemplo:** `data/`
-- **Arquivos temporários de saída:** `temp/`
+- **Arquivos de saída temporários:** `temp/`
 - **Documentação:** `docs/`
 
 ## Módulos
 
-- **`src/main.rs`** — Binário `pipeline`: orquestra o fluxo MP4 → WAV intermediário → WAV processado em 2 etapas
-- **`src/bin/transcribe.rs`** — Binário `transcribe`: recebe um WAV, chama a API Azure OpenAI e exibe transcrição com métricas de tokens e custo
-- **`src/lib.rs`** — Raiz da crate de biblioteca; reexporta os três módulos públicos
-- **`src/audio_processor/`** — Processamento de áudio em 2 passes ffmpeg: 9 filtros configuráveis (bandpass, denoising FFT/NLM, EQ, compressão, noise gate, normalização, limiter, VAD)
-- **`src/audio_processor/filters.rs`** — Construtores de strings de filtros ffmpeg individuais (bandpass, adeclick, afftdn, anlmdn, voice_eq, compression, noise_gate, loudness_normalization, limiter, silence_removal)
-- **`src/converter/`** — Conversão MP4 → WAV mono 16 kHz 16-bit via ffmpeg; valida entrada e gerencia diretório de saída
-- **`src/transcriber/`** — Orquestração da transcrição: divide áudio em chunks de 700 s quando necessário, acumula tokens e faz parse de segmentos por falante
-- **`src/transcriber/azure.rs`** — Cliente HTTP blocking para a API de transcrição do Azure OpenAI (multipart/form-data)
+- **`src/main.rs`** — Binário `pipeline`: orquestra o fluxo MP4 → WAV intermediário (tmpdir do SO) → WAV processado em 2 etapas, removendo o intermediário ao final
+- **`src/bin/transcribe.rs`** — Binário `transcribe`: recebe um WAV, chama o módulo `transcriber` e serializa transcrição com diarização em `<stem>_transcript.json`
+- **`src/bin/summarize.rs`** — Binário `summarize`: recebe `transcript.json` + `.vtt` do Teams, identifica falantes reais e gera resumo executivo em `<stem>_summary.json`
+- **`src/lib.rs`** — Raiz da crate de biblioteca; reexporta os quatro módulos públicos (`audio_processor`, `converter`, `transcriber`, `summarizer`)
+- **`src/audio_processor/`** — Processamento de áudio em 2 passes ffmpeg com 9 filtros configuráveis: bandpass HPF/LPF, adeclick, afftdn, anlmdn, voice EQ, compressão, noise gate, dynaudnorm, alimiter, VAD
+- **`src/audio_processor/filters.rs`** — Construtores de strings de filtros ffmpeg individuais (cada filtro em função separada)
+- **`src/converter/`** — Conversão MP4 → WAV mono 16 kHz 16-bit PCM via ffmpeg; valida entrada, gerencia diretório de saída e define `ConverterError`
+- **`src/transcriber/`** — Orquestra a transcrição: arquivos até ~180 MB em requisição única; acima disso divide em chunks de 3 000 s com ajuste de timestamps globais
+- **`src/transcriber/azure_speech.rs`** — Cliente HTTP blocking para a Azure AI Speech Fast Transcription API (multipart/form-data, `api-version=2024-11-15`)
+- **`src/summarizer/`** — Identificação de falantes reais e geração de resumo executivo; define `SummarizerConfig`, `SummaryResult` e `SummarizerError`
+- **`src/summarizer/vtt.rs`** — Parser do formato WebVTT do Teams, extrai entradas `<v Name>`
+- **`src/summarizer/matcher.rs`** — Matching por timestamp (tolerância configurável) entre `Speaker N` da transcrição e nomes reais do VTT
+- **`src/summarizer/llm.rs`** — Cliente HTTP blocking para Azure OpenAI chat completions; confirma mapeamento e gera resumo/action items/decisões
 
 ## Arquitetura
 
-- **Estilo:** Pipeline modular — dois binários CLI independentes que compartilham uma biblioteca interna
-- **Descrição:** `pipeline` usa `converter` + `audio_processor` para preparar o áudio; `transcribe` usa `transcriber` (que delega ao cliente `azure`) para enviar o WAV à API e serializar o resultado em JSON. Os módulos se comunicam apenas por tipos Rust explícitos (`Result`, structs de config) sem estado global.
+- **Estilo:** Pipeline modular — três binários CLI independentes que compartilham uma biblioteca interna (`rust_stt`)
+- **Descrição:** `pipeline` usa `converter` + `audio_processor` para preparar o áudio; `transcribe` usa `transcriber` (que delega ao cliente `azure_speech`) para enviar o WAV à API e gravar JSON; `summarize` usa `summarizer` (que usa `vtt`, `matcher` e `llm`) para identificar falantes via VTT do Teams e gerar resumo via Azure OpenAI. Os módulos se comunicam apenas por tipos Rust explícitos (`Result<T, ModuleError>`, structs de configuração) sem estado global.
 
 ## Variáveis de Ambiente
 
 > Copie `.env.example` para `.env` e ajuste os valores.
 
-- **Obrigatórias:** `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_DEPLOYMENT_STT`
-- **Opcionais:** `AZURE_OPENAI_API_VERSION` (padrão: `2025-04-01-preview`), `AZURE_OPENAI_LANGUAGE` (padrão: detecção automática, ex.: `pt`)
+- **Azure OpenAI (obrigatórias para todos os módulos):** `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`
+- **Summarizer (obrigatória):** `AZURE_OPENAI_DEPLOYMENT` (ex.: `gpt-5.4-mini`)
+- **Summarizer (opcional):** `AZURE_OPENAI_API_VERSION` (padrão: `2025-01-01-preview`)
+- **Transcrição — Speech (opcionais, fallback para `AZURE_OPENAI_*`):** `AZURE_SPEECH_KEY`, `AZURE_SPEECH_ENDPOINT`, `AZURE_SPEECH_LANGUAGE` (padrão: `pt-BR`), `AZURE_SPEECH_MAX_SPEAKERS` (padrão: `10`)
 
 ## Testes
 
 - **Framework:** Rust built-in (`#[cfg(test)]` + `#[test]`)
-- **Diretório:** embutidos em cada módulo (`src/audio_processor/mod.rs`, `src/converter/mod.rs`, `src/transcriber/mod.rs`, `src/bin/transcribe.rs`)
+- **Diretório:** embutidos em cada módulo (`src/converter/mod.rs`, `src/transcriber/mod.rs`, `src/summarizer/mod.rs`, `src/bin/summarize.rs`)
 - **Executar todos:** `cargo test`
 - **Testes de integração:** dependem de `ffmpeg`/`ffprobe` disponíveis no PATH; criam arquivos temporários em `$TMPDIR` e os removem ao final
 
@@ -72,9 +80,10 @@
 - **Aninhamento máximo:** 3 níveis
 - **Docstrings / comentários:** Português brasileiro
 - **Identificadores (variáveis, funções, structs, enums):** Inglês
-- **Erros:** tipos `enum` próprios por módulo implementando `std::fmt::Display` e `std::error::Error`; sem uso de `unwrap()` em código de produção
+- **Erros:** `enum` próprio por módulo (`ConverterError`, `TranscriberError`, `SummarizerError`) implementando `std::fmt::Display` e `std::error::Error`; sem `unwrap()` em código de produção
 - **Resultados:** sempre `Result<T, ModuleError>` — nunca panic em caminhos normais
-- **Rust idiomático:** `|` para padrões, `?` para propagação de erros, sem `clone()` desnecessário
+- **Rust idiomático:** `?` para propagação de erros, sem `clone()` desnecessário, `map_err` para conversões de erro entre camadas
+- **Testes:** cada módulo inclui testes unitários (lógica pura) e de integração (dependem de ffmpeg) separados por comentários `// ---`
 
 ## Commits
 
@@ -84,6 +93,8 @@ Antes de commitar, carregue a skill de commit:
 ```
 /skill:git-commit-push
 ```
+
+Ou siga diretamente as regras em `.agents/skills/git-commit-push/SKILL.md`.
 
 ## Agentes e Skills
 
