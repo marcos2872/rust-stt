@@ -247,6 +247,11 @@ Arquivo `<stem>_summary.json` salvo no mesmo diretorio do transcript:
     "A plataforma deve ser desenhada de forma escalavel"
   ],
   "segment_count": 99,
+  "token_usage": {
+    "prompt_tokens": 12480,
+    "completion_tokens": 1024,
+    "total_tokens": 13504
+  },
   "transcript": [
     {
       "speaker": "Mariana Cardoso Fabre Albino",
@@ -267,6 +272,9 @@ Arquivo `<stem>_summary.json` salvo no mesmo diretorio do transcript:
 | `summary` | string | Resumo executivo em 3-5 paragrafos |
 | `action_items` | array | Pontos de acao com responsavel nomeado |
 | `key_decisions` | array | Decisoes tomadas na reuniao |
+| `token_usage.prompt_tokens` | number | Tokens de entrada consumidos pelo LLM |
+| `token_usage.completion_tokens` | number | Tokens de saída gerados pelo LLM |
+| `token_usage.total_tokens` | number | Total de tokens da chamada |
 | `segment_count` | number | Total de segmentos na transcricao |
 | `transcript[].speaker` | string | Nome real do falante |
 | `transcript[].time` | string | Timestamp formatado (`MM:SS`) |
